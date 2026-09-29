@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.4](https://github.com/josef109/ashsa/compare/v0.2.3...v0.2.4) - 2026-09-29
+
+### Fixed
+
+- *(ci)* pin to 1.97 for now
+
+### Other
+
+- retry
+- *(deps)* update actions/checkout action to v7
+- update readme
+
 ## [0.2.3](https://github.com/joshtgl/ashsa/compare/v0.2.2...v0.2.3) - 2026-06-15
 
 ### Fixed

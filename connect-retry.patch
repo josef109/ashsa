@@ -1,0 +1,316 @@
+--- a/Cargo.toml	2026-09-29 19:00:25.426111878 +0000
++++ b/Cargo.toml	2026-09-29 19:04:48.818460640 +0000
+@@ -10,9 +10,10 @@
+ reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+ serde = { version = "1.0.228", features = ["derive"] }
+ serde_json = "1.0.150"
+-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
++tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time"] }
+ tracing = "0.1.44"
+ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+ 
+ [dev-dependencies]
+ mockito = "1.7.2"
++tokio = { version = "1.52.3", features = ["io-util", "net", "time"] }
+--- a/src/handler.rs	2026-09-29 19:00:25.426570417 +0000
++++ b/src/handler.rs	2026-09-29 19:04:58.382219129 +0000
+@@ -1,12 +1,37 @@
+ use crate::config::Config;
+ use reqwest::{Client, StatusCode};
+ use serde_json::{Value, json};
+-use tracing::{debug, error, info};
++use std::time::Duration;
++use tracing::{debug, error, info, warn};
++
++/// Retry behaviour for failures while *establishing* the connection to the
++/// downstream endpoint.
++///
++/// Only connect errors are retried. Once a request may have reached Home
++/// Assistant (read timeout, error status, ...) it is never sent again, so a
++/// command such as "turn on" cannot be executed twice.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct RetryPolicy {
++    /// Total number of attempts including the first one (minimum 1).
++    pub max_attempts: u32,
++    /// Pause between two attempts.
++    pub delay: Duration,
++}
++
++impl Default for RetryPolicy {
++    fn default() -> Self {
++        Self {
++            max_attempts: 2,
++            delay: Duration::from_millis(200),
++        }
++    }
++}
+ 
+ #[derive(Clone)]
+ pub struct App {
+     config: Config,
+     client: Client,
++    retry: RetryPolicy,
+ }
+ 
+ #[derive(Debug, PartialEq, Eq)]
+@@ -38,7 +63,51 @@
+ 
+ impl App {
+     pub fn new(config: Config, client: Client) -> Self {
+-        Self { config, client }
++        Self {
++            config,
++            client,
++            retry: RetryPolicy::default(),
++        }
++    }
++
++    /// Overrides the default connect-retry policy.
++    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
++        self.retry = retry;
++        self
++    }
++
++    async fn send_with_retry(
++        &self,
++        url: &str,
++        token: &str,
++        event: &Value,
++    ) -> Result<reqwest::Response, reqwest::Error> {
++        let max_attempts = self.retry.max_attempts.max(1);
++        let mut attempt = 1;
++
++        loop {
++            match self
++                .client
++                .post(url)
++                .bearer_auth(token)
++                .json(event)
++                .send()
++                .await
++            {
++                Ok(response) => return Ok(response),
++                Err(err) if err.is_connect() && attempt < max_attempts => {
++                    warn!(
++                        attempt,
++                        max_attempts,
++                        error = %err,
++                        "connecting to downstream endpoint failed, retrying"
++                    );
++                    tokio::time::sleep(self.retry.delay).await;
++                    attempt += 1;
++                }
++                Err(err) => return Err(err),
++            }
++        }
+     }
+ 
+     pub async fn handle_event(&self, event: Value) -> Value {
+@@ -71,11 +140,7 @@
+         let url = format!("{}/api/alexa/smart_home", self.config.base_url);
+ 
+         let response = self
+-            .client
+-            .post(url)
+-            .bearer_auth(token)
+-            .json(&event)
+-            .send()
++            .send_with_retry(&url, token, &event)
+             .await
+             .map_err(|err| {
+                 HandlerError::Internal(format!("failed to call downstream endpoint: {err}"))
+@@ -210,12 +275,17 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{App, RequestError, alexa_error, extract_token, validate_payload_version};
++    use super::{
++        App, RequestError, RetryPolicy, alexa_error, extract_token, validate_payload_version,
++    };
+     use crate::client::build_http_client;
+     use crate::config::Config;
+     use mockito::{Matcher, Server};
+     use reqwest::Client;
+     use serde_json::{Value, json};
++    use std::net::SocketAddr;
++    use std::time::{Duration, Instant};
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ 
+     fn config(base_url: String) -> Config {
+         Config {
+@@ -525,4 +595,175 @@
+                 .contains("failed to call downstream endpoint")
+         );
+     }
++
++    /// Returns an address on which nothing is listening (connection refused).
++    fn unused_addr() -> SocketAddr {
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        listener.local_addr().unwrap()
++    }
++
++    /// Starts a one-shot HTTP server on `addr` after `start_delay` and answers
++    /// the first request with `body` as JSON.
++    fn spawn_late_server(
++        addr: SocketAddr,
++        start_delay: Duration,
++        body: String,
++    ) -> tokio::task::JoinHandle<()> {
++        tokio::spawn(async move {
++            tokio::time::sleep(start_delay).await;
++            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
++            let (mut socket, _) = listener.accept().await.unwrap();
++
++            // Read the complete request (headers + body) before answering.
++            let mut received = Vec::new();
++            let mut chunk = [0u8; 4096];
++            loop {
++                let n = socket.read(&mut chunk).await.unwrap();
++                received.extend_from_slice(&chunk[..n]);
++                let text = String::from_utf8_lossy(&received).to_ascii_lowercase();
++                if let Some(head_end) = text.find("\r\n\r\n") {
++                    let content_length = text
++                        .lines()
++                        .find_map(|line| line.strip_prefix("content-length:"))
++                        .and_then(|value| value.trim().parse::<usize>().ok())
++                        .unwrap_or(0);
++                    if received.len() >= head_end + 4 + content_length {
++                        break;
++                    }
++                }
++                if n == 0 {
++                    break;
++                }
++            }
++
++            let response = format!(
++                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
++                body.len(),
++                body
++            );
++            socket.write_all(response.as_bytes()).await.unwrap();
++            socket.shutdown().await.unwrap();
++        })
++    }
++
++    #[tokio::test]
++    async fn connect_failure_is_retried_until_server_is_up() {
++        let addr = unused_addr();
++        let response_body = json!({"event": {"header": {"name": "Response"}}});
++        let server = spawn_late_server(addr, Duration::from_millis(150), response_body.to_string());
++        let event = sample_event(json!({
++            "type": "BearerToken",
++            "token": "test-token"
++        }));
++
++        let app =
++            App::new(config(format!("http://{addr}")), Client::new()).with_retry(RetryPolicy {
++                max_attempts: 5,
++                delay: Duration::from_millis(100),
++            });
++        let actual = app.handle_event(event).await;
++
++        server.await.unwrap();
++        assert_eq!(actual, response_body);
++    }
++
++    #[tokio::test]
++    async fn connect_failure_gives_up_after_max_attempts() {
++        let addr = unused_addr();
++        let event = sample_event(json!({
++            "type": "BearerToken",
++            "token": "test-token"
++        }));
++
++        let app =
++            App::new(config(format!("http://{addr}")), Client::new()).with_retry(RetryPolicy {
++                max_attempts: 3,
++                delay: Duration::from_millis(50),
++            });
++        let started = Instant::now();
++        let actual = app.handle_event(event).await;
++
++        // 3 attempts => 2 pauses of 50 ms.
++        assert!(started.elapsed() >= Duration::from_millis(100));
++        assert_eq!(actual["event"]["payload"]["type"], "INTERNAL_ERROR");
++        assert!(
++            actual["event"]["payload"]["message"]
++                .as_str()
++                .unwrap()
++                .contains("failed to call downstream endpoint")
++        );
++    }
++
++    #[tokio::test]
++    async fn single_attempt_policy_does_not_retry() {
++        let addr = unused_addr();
++        let event = sample_event(json!({
++            "type": "BearerToken",
++            "token": "test-token"
++        }));
++
++        let app =
++            App::new(config(format!("http://{addr}")), Client::new()).with_retry(RetryPolicy {
++                max_attempts: 1,
++                delay: Duration::from_secs(5),
++            });
++        let started = Instant::now();
++        let actual = app.handle_event(event).await;
++
++        assert!(started.elapsed() < Duration::from_secs(2));
++        assert_eq!(actual["event"]["payload"]["type"], "INTERNAL_ERROR");
++    }
++
++    #[tokio::test]
++    async fn zero_max_attempts_still_sends_once() {
++        let mut server = Server::new_async().await;
++        let response_body = json!({"event": {"header": {"name": "Response"}}});
++        let event = sample_event(json!({
++            "type": "BearerToken",
++            "token": "test-token"
++        }));
++
++        let mock = server
++            .mock("POST", "/api/alexa/smart_home")
++            .with_status(200)
++            .with_body(response_body.to_string())
++            .expect(1)
++            .create_async()
++            .await;
++
++        let app = App::new(config(server.url()), Client::new()).with_retry(RetryPolicy {
++            max_attempts: 0,
++            delay: Duration::from_millis(10),
++        });
++        let actual = app.handle_event(event).await;
++
++        mock.assert_async().await;
++        assert_eq!(actual, response_body);
++    }
++
++    #[tokio::test]
++    async fn error_status_from_downstream_is_not_retried() {
++        let mut server = Server::new_async().await;
++        let event = sample_event(json!({
++            "type": "BearerToken",
++            "token": "test-token"
++        }));
++
++        let mock = server
++            .mock("POST", "/api/alexa/smart_home")
++            .with_status(500)
++            .with_body("boom")
++            .expect(1)
++            .create_async()
++            .await;
++
++        let app = App::new(config(server.url()), Client::new()).with_retry(RetryPolicy {
++            max_attempts: 3,
++            delay: Duration::from_millis(10),
++        });
++        let actual = app.handle_event(event).await;
++
++        mock.assert_async().await;
++        assert_eq!(actual["event"]["payload"]["type"], "INTERNAL_ERROR");
++    }
+ }
